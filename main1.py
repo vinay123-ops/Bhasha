@@ -1,108 +1,106 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
-import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-from IndicTransToolkit import IndicProcessor
+import requests
 import time
+import sys
+import psutil
+import os
 
-# --------------------
-# Model Setup
-# --------------------
-print("[INFO] Initializing model setup...")
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-model_name = "ai4bharat/indictrans2-en-indic-dist-200M"
-src_lang_default, tgt_lang_default = "eng_Latn", "hin_Deva"
+from indic_transliteration.sanscript import transliterate, DEVANAGARI, IAST  # ✅ Add script constants here
 
-print(f"[INFO] Using device: {DEVICE}")
+app = FastAPI(title="BhashaSetu Transliteration Service", version="1.0")
 
-print("[INFO] Loading model and tokenizer...")
-model = AutoModelForSeq2SeqLM.from_pretrained(
-    model_name,
-    trust_remote_code=True,
-    torch_dtype=torch.float16,
-    attn_implementation="flash_attention_2"  # Comment this if FlashAttention is not available
-).to(DEVICE)
+TRANSLATION_API_URL = "http://localhost:8000/translate"  # Translation service must be running
 
-print("[INFO] Model loaded.")
-tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-ip = IndicProcessor(inference=True)
+# Supported scripts map
+target_script_map = {
+    "IAST": IAST,
+    # Add other script constants here if needed
+}
 
-# --------------------
-# FastAPI Setup
-# --------------------
-app = FastAPI(title="BhashaSetu Translation API", version="1.0")
-
-class TranslationRequest(BaseModel):
+class TransliterationRequest(BaseModel):
     sentences: List[str]
-    src_lang: str = src_lang_default
-    tgt_lang: str = tgt_lang_default
+    target_script: str = "IAST"
+    src_lang: str = "eng_Latn"
+    tgt_lang: str = "hin_Deva"
 
-class TranslationResponse(BaseModel):
-    translations: List[str]
-    latency: float
-    model_params_millions: float
-    device: str
+class TransliterationResponse(BaseModel):
+    original: str
+    translated: str
+    transliterated: str
+    latency_ms: float
+    translation_cost: float
+    space_complexity_bytes: int
+    time_complexity_ops: int
 
 @app.get("/")
-def root():
-    return {"message": "BhashaSetu Translation API is running."}
-
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "device": DEVICE}
+    return {"status": "Transliteration service is running."}
 
-@app.post("/translate", response_model=TranslationResponse)
-def translate_text(req: TranslationRequest):
-    print("[INFO] Received translation request.")
-    if not req.sentences:
-        print("[ERROR] No input sentences provided.")
-        raise HTTPException(status_code=400, detail="No input sentences provided.")
+@app.post("/translate-and-transliterate", response_model=List[TransliterationResponse])
+def translate_and_transliterate(req: TransliterationRequest):
+    print("[INFO] Received request for translation and transliteration.")
+    print(f"[DEBUG] Input sentences: {req.sentences}")
+    print(f"[DEBUG] Source language: {req.src_lang}")
+    print(f"[DEBUG] Target language: {req.tgt_lang}")
+    print(f"[DEBUG] Target script: {req.target_script}")
 
     start_time = time.perf_counter()
+    process = psutil.Process(os.getpid())
+    mem_before = process.memory_info().rss
 
     try:
-        print("[INFO] Preprocessing input batch...")
-        batch = ip.preprocess_batch(req.sentences, src_lang=req.src_lang, tgt_lang=req.tgt_lang)
+        print("[INFO] Sending request to translation service...")
+        translation_payload = {
+            "sentences": req.sentences,
+            "src_lang": req.src_lang,
+            "tgt_lang": req.tgt_lang
+        }
+        print(f"[DEBUG] Payload sent to translation service: {translation_payload}")
+        response = requests.post(TRANSLATION_API_URL, json=translation_payload)
+        print(f"[DEBUG] Translation service responded with status: {response.status_code}")
+        response.raise_for_status()
 
-        print("[INFO] Tokenizing input batch...")
-        inputs = tokenizer(
-            batch,
-            truncation=True,
-            padding="longest",
-            return_tensors="pt",
-            return_attention_mask=True,
-        ).to(DEVICE)
-
-        print("[INFO] Generating translation...")
-        with torch.no_grad():
-            generated_tokens = model.generate(
-                **inputs,
-                use_cache=True,
-                max_length=256,
-                num_beams=5,
-                num_return_sequences=1,
-            )
-
-        print("[INFO] Decoding output tokens...")
-        decoded = tokenizer.batch_decode(
-            generated_tokens,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=True,
-        )
-
-        print("[INFO] Postprocessing translations...")
-        translations = ip.postprocess_batch(decoded, lang=req.tgt_lang)
-        latency = round(time.perf_counter() - start_time, 4)
-
-        print("[INFO] Translation completed.")
-        return TranslationResponse(
-            translations=translations,
-            latency=latency,
-            model_params_millions=round(sum(p.numel() for p in model.parameters()) / 1e6, 2),
-            device=DEVICE
-        )
+        json_response = response.json()
+        print(f"[DEBUG] Translation service JSON: {json_response}")
+        translations = json_response.get("translations", [])
+        print(f"[DEBUG] Extracted translations: {translations}")
 
     except Exception as e:
-        print(f"[ERROR] Translation failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Translation error: {str(e)}")
+        print(f"[ERROR] Failed to call translation service: {e}")
+        raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
+
+    result = []
+    for original, translated in zip(req.sentences, translations):
+        print(f"[INFO] Processing sentence: '{original}'")
+        print(f"[INFO] Transliterating: '{translated}' from Devanagari to {req.target_script}")
+
+        try:
+            if req.target_script not in target_script_map:
+                raise HTTPException(status_code=400, detail=f"Unsupported target script: {req.target_script}")
+            translit = transliterate(translated, DEVANAGARI, target_script_map[req.target_script])
+        except Exception as e:
+            print(f"[ERROR] Transliteration failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Transliteration failed: {e}")
+
+        end_time = time.perf_counter()
+        latency_ms = round((end_time - start_time) * 1000, 3)
+        translation_cost = round(len(translated) * 0.00005, 6)
+        mem_after = process.memory_info().rss
+        space_complexity_bytes = mem_after - mem_before
+        time_complexity_ops = len(original) * 5
+
+        result.append(TransliterationResponse(
+            original=original,
+            translated=translated,
+            transliterated=translit,
+            latency_ms=latency_ms,
+            translation_cost=translation_cost,
+            space_complexity_bytes=space_complexity_bytes,
+            time_complexity_ops=time_complexity_ops
+        ))
+
+    print("[INFO] Translation and transliteration complete.")
+    return result
